@@ -1,0 +1,3 @@
+# Runtime data — contains BSSIDs/MACs and local device identifiers
+logs/
+snapshot.json

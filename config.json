@@ -1,0 +1,13 @@
+{
+  "Target": "8.8.8.8",
+  "PingIntervalMs": 1000,
+  "WifiStateIntervalMs": 5000,
+  "ScanIntervalMs": 30000,
+  "EventIntervalMs": 60000,
+  "AutoRoam": true,
+  "RoamThresholdDb": 12,
+  "MinRssiToConsider": -72,
+  "SSIDOverride": "",
+  "PingHistoryMax": 3600,
+  "PingHistoryMinutes": 10
+}
