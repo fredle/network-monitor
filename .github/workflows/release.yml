@@ -112,10 +112,12 @@ jobs:
           )
           if ($env:SIGNING -eq 'true') {
             $repoAbs = (Resolve-Path ".").Path
+            # No quotes around {{file}}: vpk quotes the path itself, and quoting it again
+            # gives ""path"", which splits at the space in "Network Monitor_ExecutionStub.exe".
             $args += '--signTemplate'
             $args += ("`"$env:SIGNTOOL`" sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 " +
               "/dlib `"$repoAbs\trustedsigning\extracted\bin\x64\Azure.CodeSigning.Dlib.dll`" " +
-              "/dmdf `"$repoAbs\trustedsigning\metadata.json`" `"{{file}}`"")
+              "/dmdf `"$repoAbs\trustedsigning\metadata.json`" {{file}}")
           }
           vpk pack @args
           if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE" }
