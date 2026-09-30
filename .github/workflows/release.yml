@@ -1,0 +1,138 @@
+name: Release
+
+# Push a tag like v0.2.0 to build, (optionally) sign, and publish a Velopack release
+# to GitHub Releases. Installed copies update themselves from there.
+#
+# Signing uses Azure Trusted Signing and runs only when the `release` environment
+# defines AZURE_CLIENT_ID / AZURE_TENANT_ID / AZURE_SUBSCRIPTION_ID. Without them the
+# release is published unsigned (fine for testing; the Microsoft Store and SmartScreen
+# want it signed).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    environment: release
+    defaults:
+      run:
+        working-directory: app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME -replace '^v',''
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $cargo) { throw "Tag $tag does not match Cargo.toml version $cargo" }
+
+      - name: Run tests
+        run: cargo test --release
+        shell: pwsh
+
+      - name: Build release binary
+        run: cargo build --release
+        shell: pwsh
+
+      - name: Install vpk
+        shell: pwsh
+        run: |
+          dotnet tool install -g vpk
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Detect signing configuration
+        shell: pwsh
+        run: |
+          $on = if ("${{ vars.AZURE_CLIENT_ID }}") { 'true' } else { 'false' }
+          "SIGNING=$on" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if ($on -eq 'false') { Write-Host '::warning::No Azure signing variables; publishing an UNSIGNED release.' }
+
+      - name: Azure login (OIDC)
+        if: env.SIGNING == 'true'
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Prepare Trusted Signing
+        if: env.SIGNING == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path trustedsigning | Out-Null
+          Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client" -OutFile trustedsigning\client.nupkg
+          Expand-Archive -Path trustedsigning\client.nupkg -DestinationPath trustedsigning\extracted -Force
+          @'
+          {
+            "Endpoint": "https://weu.codesigning.azure.net/",
+            "CodeSigningAccountName": "leatham-signing-account",
+            "CertificateProfileName": "cert-profile"
+          }
+          '@ | Set-Content -Path trustedsigning\metadata.json -Encoding utf8
+          $signtool = Get-ChildItem -Recurse -Filter "signtool.exe" "C:\Program Files (x86)\Windows Kits\10\bin" |
+            Where-Object { $_.FullName -match "\\x64\\" } | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $signtool) { throw "signtool.exe not found" }
+          "SIGNTOOL=$signtool" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Pack with Velopack
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v',''
+
+          # vpk packs everything under -p verbatim, so stage only the exe.
+          New-Item -ItemType Directory -Force -Path target\publish | Out-Null
+          Copy-Item target\release\network-monitor.exe target\publish\ -Force
+
+          # Pull the previous release's packages so this pack can emit a delta update
+          # too. The very first release simply finds nothing to diff against.
+          vpk download github --repoUrl "https://github.com/${{ github.repository }}" --token "${{ secrets.GITHUB_TOKEN }}"
+          $global:LASTEXITCODE = 0
+
+          $args = @(
+            '--packId', 'NetworkMonitor',
+            '--packVersion', $version,
+            '--packDir', 'target\publish',
+            '--mainExe', 'network-monitor.exe',
+            '--packTitle', 'Network Monitor',
+            '--packAuthors', 'fredle',
+            '--icon', 'assets\app.ico'
+          )
+          if ($env:SIGNING -eq 'true') {
+            $repoAbs = (Resolve-Path ".").Path
+            $args += '--signTemplate'
+            $args += ("`"$env:SIGNTOOL`" sign /v /debug /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 " +
+              "/dlib `"$repoAbs\trustedsigning\extracted\bin\x64\Azure.CodeSigning.Dlib.dll`" " +
+              "/dmdf `"$repoAbs\trustedsigning\metadata.json`" `"{{file}}`"")
+          }
+          vpk pack @args
+          if ($LASTEXITCODE -ne 0) { throw "vpk pack failed with exit code $LASTEXITCODE" }
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        run: |
+          # --tag keeps the release on the v* tag that triggered this run.
+          vpk upload github --repoUrl "https://github.com/${{ github.repository }}" --tag "$env:GITHUB_REF_NAME" --publish --token "${{ secrets.GITHUB_TOKEN }}"
+          if ($LASTEXITCODE -ne 0) { throw "vpk upload failed with exit code $LASTEXITCODE" }
+
+          # Best-effort release notes; the release is already published above.
+          $notes = gh api "repos/${{ github.repository }}/releases/generate-notes" -f tag_name="$env:GITHUB_REF_NAME" --jq .body
+          if ($LASTEXITCODE -eq 0 -and $notes) {
+            Set-Content -Path notes.md -Value $notes -Encoding utf8
+            gh release edit "$env:GITHUB_REF_NAME" --notes-file notes.md
+          }
+          $global:LASTEXITCODE = 0
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

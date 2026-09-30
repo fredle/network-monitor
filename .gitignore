@@ -1,3 +1,9 @@
 # Runtime data — contains BSSIDs/MACs and local device identifiers
 logs/
 snapshot.json
+
+# Rust app build output and packaged releases
+app/target/
+app/Releases/
+*.msix
+*.msixupload

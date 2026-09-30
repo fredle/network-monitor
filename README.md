@@ -1,5 +1,8 @@
 # Network Monitor
 
+> **Note:** this PowerShell script is the original version and is kept for reference. The maintained app is the Rust rewrite in [`app/`](app/README.md): no administrator rights, a 3 MB always-running process, a Settings panel, and automatic updates.
+
+
 A small tray app (PowerShell + WinForms) that:
 
 - Continuously pings `8.8.8.8` (configurable) at 1 Hz and tracks drops + latency.
