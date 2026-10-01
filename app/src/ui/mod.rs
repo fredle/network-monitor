@@ -13,11 +13,11 @@ use eframe::egui::{self, Color32, RichText, ViewportCommand};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use windows::core::HSTRING;
-use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, POINT};
+use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetCursorPos, GetWindowRect, SetForegroundWindow, ShowWindow, SW_RESTORE};
 
 const POPUP_SIZE: [f32; 2] = [400.0, 240.0];
 const WINDOW_SIZE: [f32; 2] = [760.0, 600.0];
@@ -82,7 +82,7 @@ pub fn run(kind: &str, anchor: Option<(i32, i32)>) -> i32 {
                 style.visuals.panel_fill = Color32::from_rgb(24, 24, 28);
                 style.visuals.window_fill = Color32::from_rgb(24, 24, 28);
             });
-            Ok(Box::new(UiApp::new(kind, tab, cc.egui_ctx.clone())))
+            Ok(Box::new(UiApp::new(kind, tab, cc.egui_ctx.clone(), anchor.unwrap_or((0, 0)))))
         }),
     );
     if result.is_err() { 1 } else { 0 }
@@ -142,12 +142,13 @@ struct UiApp {
     next_connect: Instant,
     data: Data,
     panel: settings_panel::State,
-    had_focus: bool,
+    anchor: (i32, i32),
+    outside_since: Option<Instant>,
     opened_at: Instant,
 }
 
 impl UiApp {
-    fn new(kind: Kind, tab: Tab, ctx: egui::Context) -> Self {
+    fn new(kind: Kind, tab: Tab, ctx: egui::Context, anchor: (i32, i32)) -> Self {
         Self {
             kind,
             tab,
@@ -162,7 +163,8 @@ impl UiApp {
                 notice: None,
             },
             panel: settings_panel::State::default(),
-            had_focus: false,
+            anchor,
+            outside_since: None,
             opened_at: Instant::now(),
         }
     }
@@ -281,20 +283,22 @@ impl eframe::App for UiApp {
 
 impl UiApp {
     fn popup_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(false));
-        if focused {
-            self.had_focus = true;
-        } else if self.had_focus || self.opened_at.elapsed() > Duration::from_secs(3) {
-            // Lost focus (clicked elsewhere), or never got it: close like a flyout.
-            ctx.send_viewport_cmd(ViewportCommand::Close);
+        if self.opened_at.elapsed() > Duration::from_millis(300) && !self.cursor_near_popup() {
+            let since = *self.outside_since.get_or_insert_with(Instant::now);
+            if since.elapsed() > Duration::from_millis(700) {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        } else {
+            self.outside_since = None;
         }
-        if self.opened_at.elapsed() < Duration::from_millis(200) {
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
-        }
+        // Only poll the cursor while open; hover-out has no input event for us.
+        ctx.request_repaint_after(Duration::from_millis(100));
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
         }
+        let mut clicked = false;
         egui::CentralPanel::default().frame(egui::Frame::NONE.fill(Color32::from_rgb(24, 24, 28))).show(ui, |ui| {
+            clicked = ui.interact(ui.max_rect(), ui.id().with("open"), egui::Sense::click()).clicked();
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.add_space(6.0);
@@ -306,6 +310,33 @@ impl UiApp {
             let size = ui.available_size();
             chart::draw(ui, size, samples, self.data.settings.high_latency_ms * 3 / 4);
         });
+        if clicked {
+            // Ask the daemon to show the main window, then dismiss the mini window.
+            self.send(Request::ShowWindow("status".into()));
+            ctx.send_viewport_cmd(ViewportCommand::Close);
+        }
+    }
+
+    /// True while the cursor is over the popup or still near the tray icon it came from.
+    fn cursor_near_popup(&self) -> bool {
+        unsafe {
+            let mut c = POINT::default();
+            if GetCursorPos(&mut c).is_err() {
+                return true;
+            }
+            let (ax, ay) = self.anchor;
+            if (c.x - ax).abs() < 32 && (c.y - ay).abs() < 32 {
+                return true;
+            }
+            match FindWindowW(None, &HSTRING::from("Network Monitor popup")) {
+                Ok(w) => {
+                    let mut r = RECT::default();
+                    GetWindowRect(w, &mut r).is_ok()
+                        && c.x >= r.left && c.x <= r.right && c.y >= r.top && c.y <= r.bottom
+                }
+                Err(_) => true,
+            }
+        }
     }
 
     fn status_ui(&mut self, ui: &mut egui::Ui) {

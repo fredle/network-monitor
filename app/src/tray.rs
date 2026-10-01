@@ -4,13 +4,12 @@
 
 use crate::engine::Shared;
 use crate::icon;
-use crate::model::{Health, Request, Snapshot, UpdateStatus};
+use crate::model::{Health, Request, Sample, Snapshot, UpdateStatus};
 use crate::paths::APP_TITLE;
 use crate::update;
 use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -21,7 +20,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const WM_WAKE: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
-const POPUP_DEBOUNCE: Duration = Duration::from_millis(400);
 
 /// Things other threads (pipe server, menu/tray callbacks) ask the main thread to do.
 pub enum Action {
@@ -33,7 +31,6 @@ pub enum Action {
 struct Ui {
     window: Option<Child>,
     popup: Option<Child>,
-    popup_closed_at: Option<Instant>,
 }
 
 impl Ui {
@@ -56,24 +53,13 @@ impl Ui {
         self.window = Self::spawn(tab, None);
     }
 
-    fn toggle_popup(&mut self, anchor: (i32, i32)) {
+    /// Hovering the tray icon opens the mini window; the popup process closes
+    /// itself once the cursor leaves both the icon and the popup.
+    fn open_popup(&mut self, anchor: (i32, i32)) {
         if let Some(child) = self.popup.as_mut() {
-            match child.try_wait() {
-                Ok(None) => {
-                    let _ = child.kill();
-                    self.popup = None;
-                    self.popup_closed_at = Some(Instant::now());
-                    return;
-                }
-                _ => {
-                    self.popup = None;
-                    self.popup_closed_at = Some(Instant::now());
-                }
+            if matches!(child.try_wait(), Ok(None)) {
+                return;
             }
-        }
-        // The click that dismissed a popup (by taking focus) must not reopen it.
-        if self.popup_closed_at.map_or(false, |t| t.elapsed() < POPUP_DEBOUNCE) {
-            return;
         }
         self.popup = Self::spawn("popup", Some(anchor));
     }
@@ -141,7 +127,7 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
         &m_quit,
     ]);
 
-    let tray = build_tray(menu, Health::Idle);
+    let tray = build_tray(menu);
     let Some(tray) = tray else {
         crate::logging::error("could not create the tray icon");
         return rx;
@@ -149,8 +135,8 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
 
     crate::platform::promote_tray_icon();
 
-    let mut ui = Ui { window: None, popup: None, popup_closed_at: None };
-    let mut shown_health = Health::Idle;
+    let mut ui = Ui { window: None, popup: None };
+    let mut shown_health = (Health::Idle, i64::MIN);
     let mut update_ready = false;
 
     unsafe {
@@ -190,13 +176,16 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
                                 unsafe { PostQuitMessage(0) };
                             }
                         }
+                        // tray-icon only re-arms `Enter` after a `Leave`, which it can miss, so Move counts too.
+                        Action::Tray(TrayIconEvent::Enter { position, .. } | TrayIconEvent::Move { position, .. }) => {
+                            ui.open_popup((position.x as i32, position.y as i32))
+                        }
                         Action::Tray(TrayIconEvent::Click {
                             button: MouseButton::Left,
                             button_state: MouseButtonState::Up,
-                            position,
                             ..
-                        }) => ui.toggle_popup((position.x as i32, position.y as i32)),
-                        Action::Tray(TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }) => {
+                        })
+                        | Action::Tray(TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }) => {
                             ui.close_popup();
                             ui.show_window("status");
                         }
@@ -225,18 +214,18 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
     rx
 }
 
-fn build_tray(menu: Menu, health: Health) -> Option<TrayIcon> {
+fn build_tray(menu: Menu) -> Option<TrayIcon> {
     TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_menu_on_left_click(false)
-        .with_icon(health_icon(health)?)
+        .with_icon(health_icon(&[], Health::Idle)?)
         .with_tooltip(APP_TITLE)
         .build()
         .ok()
 }
 
-fn health_icon(h: Health) -> Option<Icon> {
-    Icon::from_rgba(icon::status_rgba(h, 32), 32, 32).ok()
+fn health_icon(samples: &[Sample], h: Health) -> Option<Icon> {
+    Icon::from_rgba(icon::sparkline_rgba(samples, h, 32), 32, 32).ok()
 }
 
 fn refresh(
@@ -244,15 +233,18 @@ fn refresh(
     tray: &TrayIcon,
     m_status: &MenuItem,
     m_update: &MenuItem,
-    shown: &mut Health,
+    shown: &mut (Health, i64),
     update_ready: &mut bool,
 ) {
     let snap = shared.snapshot();
     let health = snap.health(&shared.settings());
-    if health != *shown {
-        if let Some(i) = health_icon(health) {
+    // Redraw the sparkline only when a new ping arrived or the health colour changed.
+    let samples = shared.recent_samples(28);
+    let key = (health, samples.last().map_or(0, |s| s.t));
+    if key != *shown {
+        if let Some(i) = health_icon(&samples, health) {
             let _ = tray.set_icon(Some(i));
-            *shown = health;
+            *shown = key;
         }
     }
     let _ = tray.set_tooltip(Some(tooltip(&snap)));

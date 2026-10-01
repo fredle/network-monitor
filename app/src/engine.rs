@@ -78,6 +78,13 @@ impl Shared {
         self.lock().snap.clone()
     }
 
+    /// The newest `n` samples, oldest first (for the tray sparkline).
+    pub fn recent_samples(&self, n: usize) -> Vec<Sample> {
+        let g = self.lock();
+        let skip = g.history.len().saturating_sub(n);
+        g.history.iter().skip(skip).copied().collect()
+    }
+
     pub fn is_quitting(&self) -> bool {
         self.quit.load(Ordering::Relaxed)
     }

@@ -1,8 +1,8 @@
-//! Procedurally drawn icons (no image assets to ship): the coloured status dot
+//! Procedurally drawn icons (no image assets to ship): the latency sparkline
 //! for the tray and the Wi-Fi-arcs app icon for windows and the .exe.
 //! Shapes are analytic signed-distance fields, so edges are anti-aliased at any size.
 
-use crate::model::Health;
+use crate::model::{Health, Sample};
 
 type Px = [f32; 4]; // premultiplied-free straight RGBA 0..1
 
@@ -41,19 +41,42 @@ pub fn status_color(h: Health) -> [f32; 3] {
     }
 }
 
-/// Round dot with a dark rim, `size` x `size` RGBA8.
-pub fn status_rgba(h: Health, size: u32) -> Vec<u8> {
+/// Micro latency chart: one column per recent ping on a dark rounded tile,
+/// bars tinted by health, dropped pings as dim red full-height columns.
+pub fn sparkline_rgba(samples: &[Sample], h: Health, size: u32) -> Vec<u8> {
     let s = size as f32;
-    let (c, r) = (s / 2.0, s * 0.47);
-    let fill = status_color(h);
-    let rim = rgb(30, 30, 30);
+    let inner = size.saturating_sub(4) as usize; // 2px padding each side
+    let shown = &samples[samples.len().saturating_sub(inner)..];
+    let top = shown.iter().filter_map(|m| m.ms).max().unwrap_or(0).max(100) as f32;
+    let (bg, rim, bar, drop) = (rgb(22, 24, 30), rgb(90, 90, 100), status_color(h), rgb(210, 50, 50));
+    let corner = s * 0.18;
+    let chart_h = s - 4.0;
+    let first = inner - shown.len(); // right-align so new samples enter from the right
     let mut px = vec![[0.0f32; 4]; (size * size) as usize];
     for y in 0..size {
         for x in 0..size {
-            let d = ((x as f32 + 0.5 - c).powi(2) + (y as f32 + 0.5 - c).powi(2)).sqrt() - r;
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let (qx, qy) = ((fx - s / 2.0).abs() - (s / 2.0 - corner), (fy - s / 2.0).abs() - (s / 2.0 - corner));
+            let d = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt() + qx.max(qy).min(0.0) - corner;
             let p = &mut px[(y * size + x) as usize];
             over(p, rim, cov(d));
-            over(p, fill, cov(d + (s / 16.0).max(1.0)));
+            over(p, bg, cov(d + 1.0));
+
+            let col = x as i64 - 2 - first as i64;
+            if col < 0 || col as usize >= shown.len() {
+                continue;
+            }
+            let from_bottom = s - 2.0 - fy; // 0 at the chart floor
+            match shown[col as usize].ms {
+                None => over(p, drop, 0.55 * (from_bottom >= 0.0 && from_bottom <= chart_h) as u8 as f32),
+                Some(ms) => {
+                    let bar_h = (ms as f32 / top).min(1.0) * chart_h;
+                    let bar_h = bar_h.max(1.5);
+                    // fractional coverage on the top row of the bar anti-aliases its height
+                    let c = (bar_h - from_bottom + 0.5).clamp(0.0, 1.0) * (from_bottom >= -0.5) as u8 as f32;
+                    over(p, bar, c);
+                }
+            }
         }
     }
     to_bytes(&px)
@@ -107,13 +130,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_icon_has_opaque_centre_and_transparent_corner() {
-        let b = status_rgba(Health::Good, 32);
-        let at = |x: usize, y: usize| &b[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4];
-        assert_eq!(at(16, 16)[3], 255);
-        assert_eq!(at(0, 0)[3], 0);
-        // Green channel dominates for "good".
-        assert!(at(16, 16)[1] > at(16, 16)[0]);
+    fn sparkline_draws_bars_and_handles_empty_history() {
+        let at = |b: &[u8], x: usize, y: usize| b[(y * 32 + x) * 4..(y * 32 + x) * 4 + 4].to_vec();
+        let empty = sparkline_rgba(&[], Health::Idle, 32);
+        assert_eq!(empty.len(), 32 * 32 * 4);
+
+        let samples: Vec<Sample> = (0..40).map(|t| Sample { t, ms: Some(100) }).collect();
+        let b = sparkline_rgba(&samples, Health::Good, 32);
+        let p = at(&b, 16, 4); // full-height bar reaches near the top
+        assert!(p[1] > p[0] && p[3] == 255, "good bar is green: {p:?}");
+
+        let dropped = [Sample { t: 0, ms: None }];
+        let b = sparkline_rgba(&dropped, Health::Bad, 32);
+        let p = at(&b, 29, 16); // right-aligned
+        assert!(p[0] > p[1], "dropped ping is red: {p:?}");
     }
 
     #[test]

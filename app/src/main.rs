@@ -84,7 +84,7 @@ fn run_daemon(background: bool) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(1500));
             if s.settings().notifications {
-                platform::toast("Network Monitor", "Running in the notification area.");
+                platform::toast("Network Monitor is running", "");
             }
         });
     }

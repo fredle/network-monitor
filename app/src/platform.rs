@@ -53,10 +53,15 @@ fn try_toast(title: &str, body: &str) -> windows::core::Result<()> {
     unsafe {
         let _ = RoInitialize(RO_INIT_MULTITHREADED);
     }
+    // An empty body gives a compact one-line toast.
+    let body_line = if body.is_empty() {
+        String::new()
+    } else {
+        format!("<text>{}</text>", xml_escape(body))
+    };
     let xml = format!(
-        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text>{body_line}</binding></visual><audio silent=\"true\"/></toast>",
         xml_escape(title),
-        xml_escape(body)
     );
     let doc = XmlDocument::new()?;
     doc.LoadXml(&HSTRING::from(xml))?;
