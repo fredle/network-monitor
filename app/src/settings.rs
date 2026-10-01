@@ -90,7 +90,7 @@ impl Default for Settings {
             log_retention_days: 14,
 
             notifications: true,
-            start_with_windows: false,
+            start_with_windows: true,
 
             auto_update: true,
             auto_install_updates: false,

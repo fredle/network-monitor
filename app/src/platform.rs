@@ -74,6 +74,37 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }
 
+/// Windows 11 parks new tray icons in the overflow flyout. Once the shell has
+/// created this exe's NotifyIconSettings entry, set `IsPromoted` so the icon is
+/// shown on the taskbar. Only done while the value is absent: if the user moves
+/// the icon back, Windows writes `IsPromoted = 0` and we leave it alone.
+pub fn promote_tray_icon() {
+    if is_packaged() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let exe = exe.to_string_lossy().to_lowercase();
+        let base = r"Control Panel\NotifyIconSettings";
+        // The shell registers the icon asynchronously; retry for a few seconds.
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let Ok(root) = windows_registry::CURRENT_USER.open(base) else { continue };
+            let Ok(names) = root.keys() else { continue };
+            for name in names {
+                let Ok(k) = windows_registry::CURRENT_USER.create(format!(r"{base}\{name}")) else { continue };
+                let path = k.get_string("ExecutablePath").unwrap_or_default().to_lowercase();
+                if path == exe {
+                    if k.get_u32("IsPromoted").is_err() {
+                        let _ = k.set_u32("IsPromoted", 1);
+                    }
+                    return;
+                }
+            }
+        }
+    });
+}
+
 // ---- start with Windows -----------------------------------------------------
 
 /// Enable/disable launching at sign-in. Store builds use the manifest's

@@ -28,7 +28,10 @@ use windows::Win32::System::Threading::CreateMutexW;
 fn main() {
     // Velopack install/update/uninstall hooks. Must be first: during those events
     // the process does its bookkeeping and exits before anything else runs.
-    velopack::VelopackApp::build().set_app_user_model_id(paths::AUMID).run();
+    velopack::VelopackApp::build()
+        .set_app_user_model_id(paths::AUMID)
+        .on_first_run(|_| update::FIRST_RUN.store(true, std::sync::atomic::Ordering::Relaxed))
+        .run();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(i) = args.iter().position(|a| a == "--ui") {
@@ -64,6 +67,13 @@ fn run_daemon(background: bool) {
     logging::init(paths::log_dir());
     platform::register_toast_identity();
 
+    // Start with Windows by default: register on the very first run only (no
+    // settings file yet), so turning it off later is respected.
+    if !paths::settings_file().exists() {
+        if let Err(e) = platform::set_start_with_windows(true) {
+            logging::warn(&format!("could not enable start with Windows: {e}"));
+        }
+    }
     let settings = Settings::load(&paths::settings_file());
     let shared = engine::Shared::new(settings);
     shared.start();

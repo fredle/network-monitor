@@ -56,8 +56,10 @@ fn main() {
         ("Square150x150Logo.png", 150, 150),
         ("Square310x310Logo.png", 310, 310),
         ("Wide310x150Logo.png", 310, 150),
+        ("StoreBoxArt1080x1080.png", 1080, 1080),
+        ("StorePoster720x1080.png", 720, 1080),
     ] {
         png(&assets.join(name), w, h, padded(w, h));
     }
-    println!("wrote assets/app.ico and {} Store logos", 6);
+    println!("wrote assets/app.ico and {} Store logos", 8);
 }

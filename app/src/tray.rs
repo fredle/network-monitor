@@ -147,6 +147,8 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
         return rx;
     };
 
+    crate::platform::promote_tray_icon();
+
     let mut ui = Ui { window: None, popup: None, popup_closed_at: None };
     let mut shown_health = Health::Idle;
     let mut update_ready = false;

@@ -11,10 +11,14 @@ use crate::logging;
 use crate::model::UpdateStatus;
 use crate::platform;
 use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use velopack::sources::AutoSource;
 use velopack::{UpdateCheck, UpdateManager, VelopackAsset};
+
+/// Set by the Velopack first-run hook: the app was just started by the installer.
+pub static FIRST_RUN: AtomicBool = AtomicBool::new(false);
 
 pub enum Cmd {
     CheckNow,
@@ -64,9 +68,12 @@ fn run(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Cmd>) {
         return;
     }
 
-    // Give the tray a moment to settle before the first network call.
-    let mut wait = Duration::from_secs(20);
-    let mut forced = false;
+    // Right after install the bundled version may already be stale, so check at
+    // once and install without asking. Otherwise let the tray settle first.
+    let first_run = FIRST_RUN.load(Ordering::Relaxed);
+    let mut wait = Duration::from_secs(if first_run { 3 } else { 20 });
+    let mut forced = first_run;
+    let mut first_done = false;
     loop {
         match rx.recv_timeout(wait) {
             Ok(Cmd::CheckNow) => forced = true,
@@ -87,6 +94,8 @@ fn run(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Cmd>) {
         if !forced && !s.auto_update {
             continue;
         }
+        let first_run_check = forced && first_run && !first_done;
+        first_done = true;
         forced = false;
         if s.update_source.is_empty() {
             shared.set_update_status(UpdateStatus::Failed("No update source is configured.".into()));
@@ -99,7 +108,7 @@ fn run(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Cmd>) {
             Ok(Some(asset)) => {
                 shared.set_update_status(UpdateStatus::Ready(asset.Version.clone()));
                 logging::info(&format!("update {} downloaded", asset.Version));
-                if s.auto_install_updates {
+                if s.auto_install_updates || first_run_check {
                     apply(&shared, &asset);
                 }
                 pending = Some(asset);
