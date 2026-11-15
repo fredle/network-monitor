@@ -50,6 +50,7 @@ fn main() {
 
 fn run_daemon(background: bool) {
     platform::set_app_identity();
+    platform::keep_mta_alive();
 
     // One daemon per user session. A second launch (Start menu, double-click)
     // just asks the running one to show its window.

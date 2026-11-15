@@ -7,6 +7,7 @@ use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::Foundation::{APPMODEL_ERROR_NO_PACKAGE, ERROR_INSUFFICIENT_BUFFER};
 use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
+use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
@@ -41,6 +42,23 @@ pub fn register_toast_identity() {
     if let Ok(k) = windows_registry::CURRENT_USER.create(&key) {
         let _ = k.set_string("DisplayName", APP_TITLE);
     }
+}
+
+/// Pin the COM multithreaded apartment for the life of the process.
+///
+/// Toasts (and other WinRT calls) run on short-lived threads that join the MTA.
+/// windows-rs caches activation factories process-wide, but when the last MTA
+/// thread exits COM tears the apartment down and frees them, so the next call
+/// went through a dangling pointer and crashed the daemon. Holding an MTA usage
+/// cookie keeps the apartment (and the cached factories) alive. Call once, early.
+pub fn keep_mta_alive() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // The cookie is deliberately leaked: the apartment should outlive every thread.
+        if let Err(e) = unsafe { CoIncrementMTAUsage() } {
+            crate::logging::warn(&format!("CoIncrementMTAUsage failed: {e}"));
+        }
+    });
 }
 
 pub fn toast(title: &str, body: &str) {
@@ -159,4 +177,27 @@ fn startup_task_enabled() -> Option<bool> {
     use windows::ApplicationModel::{StartupTask, StartupTaskState};
     let task = StartupTask::GetAsync(&HSTRING::from(STARTUP_TASK_ID)).ok()?.join().ok()?;
     Some(task.State().ok()? == StartupTaskState::Enabled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: every toast runs on a short-lived thread. When the last MTA
+    /// thread exits, COM tears the apartment down and the activation factory that
+    /// windows-rs cached on the first toast is freed, so the second toast crashed
+    /// the daemon (0xc0000005 in `XmlDocument::new`). Mirror that sequence.
+    #[test]
+    fn winrt_survives_short_lived_mta_threads() {
+        keep_mta_alive();
+        for _ in 0..3 {
+            std::thread::spawn(|| unsafe {
+                let _ = RoInitialize(RO_INIT_MULTITHREADED);
+                let doc = XmlDocument::new().expect("XmlDocument");
+                doc.LoadXml(&HSTRING::from("<toast/>")).expect("LoadXml");
+            })
+            .join()
+            .expect("toast thread");
+        }
+    }
 }
