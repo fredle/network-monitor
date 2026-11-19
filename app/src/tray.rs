@@ -11,15 +11,19 @@ use std::process::{Child, Command};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, Rect, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use windows::Win32::Foundation::POINT;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AllowSetForegroundWindow, DispatchMessageW, GetMessageW, KillTimer, PostQuitMessage, PostThreadMessageW,
+    AllowSetForegroundWindow, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, PostQuitMessage, PostThreadMessageW,
     SetTimer, TranslateMessage, ASFW_ANY, MSG, WM_APP, WM_TIMER,
 };
 
 const WM_WAKE: u32 = WM_APP + 1;
 const TIMER_ID: usize = 1;
+/// How long the cursor must rest on the tray icon before the mini window opens,
+/// so merely sweeping the mouse across the taskbar doesn't pop it up.
+const HOVER_DELAY_MS: u32 = 700;
 
 /// Things other threads (pipe server, menu/tray callbacks) ask the main thread to do.
 pub enum Action {
@@ -31,6 +35,10 @@ pub enum Action {
 struct Ui {
     window: Option<Child>,
     popup: Option<Child>,
+    /// Where the pending hover popup would anchor, and the icon's bounds.
+    hover: Option<((i32, i32), Rect)>,
+    /// Thread timer counting down the hover delay (0 = none running).
+    hover_timer: usize,
 }
 
 impl Ui {
@@ -62,6 +70,55 @@ impl Ui {
             }
         }
         self.popup = Self::spawn("popup", Some(anchor));
+    }
+
+    fn popup_open(&mut self) -> bool {
+        self.popup.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)))
+    }
+
+    /// The cursor is over the icon: (re)arm the hover delay rather than opening
+    /// the popup straight away.
+    fn hover_moved(&mut self, anchor: (i32, i32), rect: Rect) {
+        if self.popup_open() {
+            return;
+        }
+        self.hover = Some((anchor, rect));
+        // Restart the countdown on every move so the popup only appears once the
+        // cursor has actually settled on the icon.
+        self.cancel_hover_timer();
+        // With no window, SetTimer ignores the id we pass and returns a fresh one.
+        self.hover_timer = unsafe { SetTimer(None, 0, HOVER_DELAY_MS, None) };
+    }
+
+    fn cancel_hover(&mut self) {
+        self.hover = None;
+        self.cancel_hover_timer();
+    }
+
+    fn cancel_hover_timer(&mut self) {
+        if self.hover_timer != 0 {
+            unsafe {
+                let _ = KillTimer(None, self.hover_timer);
+            }
+            self.hover_timer = 0;
+        }
+    }
+
+    /// The hover delay elapsed: open the popup if the cursor is still on the icon
+    /// (`Leave` events can be missed, so check rather than trust them).
+    fn hover_elapsed(&mut self) {
+        self.cancel_hover_timer();
+        let Some((anchor, rect)) = self.hover.take() else { return };
+        let mut c = POINT::default();
+        if unsafe { GetCursorPos(&mut c) }.is_err() {
+            return;
+        }
+        let (x, y) = (c.x as f64, c.y as f64);
+        let (l, t) = (rect.position.x, rect.position.y);
+        let (r, b) = (l + rect.size.width as f64, t + rect.size.height as f64);
+        if x >= l && x < r && y >= t && y < b {
+            self.open_popup(anchor);
+        }
     }
 
     fn close_popup(&mut self) {
@@ -135,13 +192,12 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
 
     crate::platform::promote_tray_icon();
 
-    let mut ui = Ui { window: None, popup: None };
+    let mut ui = Ui { window: None, popup: None, hover: None, hover_timer: 0 };
     let mut shown_health = (Health::Idle, i64::MIN);
     let mut update_ready = false;
 
-    unsafe {
-        SetTimer(None, TIMER_ID, 1000, None);
-    }
+    // Thread timers get their id from SetTimer, so keep it to tell timers apart.
+    let refresh_timer = unsafe { SetTimer(None, TIMER_ID, 1000, None) };
     refresh(&shared, &tray, &m_status, &m_update, &mut shown_health, &mut update_ready);
 
     let mut msg = MSG::default();
@@ -151,6 +207,7 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
             break; // WM_QUIT or error
         }
         match msg.message {
+            WM_TIMER if ui.hover_timer != 0 && msg.wParam.0 == ui.hover_timer => ui.hover_elapsed(),
             WM_TIMER => {
                 refresh(&shared, &tray, &m_status, &m_update, &mut shown_health, &mut update_ready);
                 if shared.is_quitting() {
@@ -177,15 +234,17 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
                             }
                         }
                         // tray-icon only re-arms `Enter` after a `Leave`, which it can miss, so Move counts too.
-                        Action::Tray(TrayIconEvent::Enter { position, .. } | TrayIconEvent::Move { position, .. }) => {
-                            ui.open_popup((position.x as i32, position.y as i32))
-                        }
+                        Action::Tray(
+                            TrayIconEvent::Enter { position, rect, .. } | TrayIconEvent::Move { position, rect, .. },
+                        ) => ui.hover_moved((position.x as i32, position.y as i32), rect),
+                        Action::Tray(TrayIconEvent::Leave { .. }) => ui.cancel_hover(),
                         Action::Tray(TrayIconEvent::Click {
                             button: MouseButton::Left,
                             button_state: MouseButtonState::Up,
                             ..
                         })
                         | Action::Tray(TrayIconEvent::DoubleClick { button: MouseButton::Left, .. }) => {
+                            ui.cancel_hover();
                             ui.close_popup();
                             ui.show_window("status");
                         }
@@ -207,8 +266,9 @@ pub fn run(shared: Arc<Shared>, updater: Sender<update::Cmd>) -> Receiver<Action
     }
 
     unsafe {
-        let _ = KillTimer(None, TIMER_ID);
+        let _ = KillTimer(None, refresh_timer);
     }
+    ui.cancel_hover();
     ui.close_popup();
     drop(tray);
     rx
